@@ -75,15 +75,18 @@ class Trainer:
             if not torch.isfinite(self.model(input_ids=ids).logits).all():
                 raise ValueError("Adapter produced non-finite logits")
 
-    def generate(self, messages, adapted, max_tokens=256):
+    def generate(self, messages, adapted, max_tokens=256, max_prompt_tokens=None):
         self.check()
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        if inputs.input_ids.shape[1] > (
-            4096 if max_tokens == 8 else self.recipe["sequence_length"]
-        ):
+        limit = (
+            max_prompt_tokens
+            if max_prompt_tokens is not None
+            else self.recipe["sequence_length"]
+        )
+        if inputs.input_ids.shape[1] > limit:
             raise ValueError("Evaluation prompt exceeds sequence limit")
         started = time.monotonic()
         with (
