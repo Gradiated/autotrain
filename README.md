@@ -18,7 +18,7 @@ trainer = Trainer("./run", recipe={
     "model": "Qwen/Qwen3-0.6B",
     "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
     "seed": 42,
-    "rank": 8,
+    "rank": 2,
     "learning_rate": 0.0002,
     "max_steps": 50,
     "sequence_length": 2048,

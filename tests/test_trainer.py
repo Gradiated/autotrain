@@ -47,7 +47,7 @@ class TrainerTests(unittest.TestCase):
         recipe = {
             "id": "test-sft",
             "seed": 42,
-            "rank": 8,
+            "rank": 2,
             "learning_rate": 0.0002,
             "max_steps": 2,
             "checkpoint_steps": 1,
