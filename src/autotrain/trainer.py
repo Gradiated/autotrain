@@ -8,7 +8,11 @@ from pathlib import Path
 
 import torch
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoTokenizer,
+)
 
 from .data import digest, example_tokens, pack, read_examples, unpack
 
@@ -33,23 +37,61 @@ class Trainer:
             revision=self.recipe["revision"],
             trust_remote_code=False,
         )
-        base = AutoModelForCausalLM.from_pretrained(
+        gpu_count = self.recipe.get("gpu_count", 1)
+        if self.device == "cuda" and torch.cuda.device_count() < gpu_count:
+            raise ValueError("The recipe requires more GPUs than were reserved")
+        loader = (
+            AutoModelForImageTextToText
+            if self.recipe.get("model_task") == "image_text_to_text"
+            else AutoModelForCausalLM
+        )
+        placement = {}
+        if self.device == "cuda" and gpu_count > 1:
+            placement = {
+                "device_map": "balanced",
+                "max_memory": {
+                    **{
+                        index: int(
+                            torch.cuda.get_device_properties(index).total_memory * 0.85
+                        )
+                        for index in range(gpu_count)
+                    },
+                    "cpu": 0,
+                },
+            }
+        base = loader.from_pretrained(
             self.recipe["model"],
             revision=self.recipe["revision"],
             trust_remote_code=False,
             torch_dtype=torch.bfloat16 if self.device == "cuda" else torch.float32,
-            attn_implementation="sdpa",
-        ).to(self.device)
+            attn_implementation=self.recipe.get("attention", "sdpa"),
+            **placement,
+        )
+        if not placement:
+            base = base.to(self.device)
+        elif any(device in ("cpu", "disk") for device in base.hf_device_map.values()):
+            raise ValueError("The model does not fit the reserved GPU memory")
         self.model = get_peft_model(
             base,
             LoraConfig(
                 r=self.recipe["rank"],
                 lora_alpha=16,
                 lora_dropout=0,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                target_modules=self.recipe.get(
+                    "target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]
+                ),
                 task_type="CAUSAL_LM",
             ),
         )
+        if self.recipe.get("gradient_checkpointing", False):
+            self.model.enable_input_require_grads()
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
+    @property
+    def input_device(self):
+        return self.model.get_input_embeddings().weight.device
 
     def check(self):
         if self.stop.is_set():
@@ -80,7 +122,7 @@ class Trainer:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.input_device)
         limit = (
             max_prompt_tokens
             if max_prompt_tokens is not None
@@ -147,7 +189,7 @@ class Trainer:
                     "type": torch.cuda.get_device_name()
                     if self.device == "cuda"
                     else "cpu",
-                    "count": 1,
+                    "count": self.recipe.get("gpu_count", 1),
                 },
                 "recipe": self.recipe["id"],
             }
@@ -181,7 +223,12 @@ class Trainer:
             step = state["step"]
             torch.set_rng_state(state["rng"].cpu())
             if self.device == "cuda":
-                torch.cuda.set_rng_state(state["cuda_rng"].cpu())
+                if "cuda_rng_all" in state:
+                    torch.cuda.set_rng_state_all(
+                        [value.cpu() for value in state["cuda_rng_all"]]
+                    )
+                else:
+                    torch.cuda.set_rng_state(state["cuda_rng"].cpu())
         if not 0 <= step <= self.recipe["max_steps"]:
             raise ValueError("Invalid checkpoint step")
         self.model.train()
@@ -198,7 +245,7 @@ class Trainer:
                 self.check()
                 example = data[(step * accumulation + micro) % len(data)]
                 batch = {
-                    key: torch.tensor([value], device=self.device)
+                    key: torch.tensor([value], device=self.input_device)
                     for key, value in example.items()
                 }
                 result = self.model(**batch).loss / accumulation
@@ -228,7 +275,7 @@ class Trainer:
                     validation_loss = sum(
                         self.model(
                             **{
-                                key: torch.tensor([value], device=self.device)
+                                key: torch.tensor([value], device=self.input_device)
                                 for key, value in item.items()
                             }
                         ).loss.item()
@@ -263,9 +310,9 @@ class Trainer:
                         "dataset_sha256": dataset_sha256,
                         "optimizer": optimizer.state_dict(),
                         "rng": torch.get_rng_state(),
-                        "cuda_rng": torch.cuda.get_rng_state()
+                        "cuda_rng_all": torch.cuda.get_rng_state_all()
                         if self.device == "cuda"
-                        else torch.get_rng_state(),
+                        else [],
                     },
                     directory / "optimizer.pt",
                 )
