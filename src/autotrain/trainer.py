@@ -265,7 +265,7 @@ class Trainer:
                 lr=self.recipe["learning_rate"],
             )
             state = torch.load(
-                directory / "optimizer.pt", map_location=self.device, weights_only=True
+                directory / "optimizer.pt", map_location="cpu", weights_only=True
             )
             if (
                 state["dataset_sha256"] != dataset_sha256

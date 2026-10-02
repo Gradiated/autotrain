@@ -83,6 +83,9 @@ be supplied here. This follows the validation/patience/best-checkpoint pattern i
 within this library's custom PyTorch loop; it does not instantiate HF `Trainer` or
 TRL `SFTTrainer`.
 
+Optimizer checkpoints load through CPU so parameter state follows each parameter’s
+GPU and Adam step counters stay portable across device placements.
+
 Checkpoints contain the current optimizer, scheduler, RNG, early stopping counters
 and a copy of the best adapter. Resuming preserves the sample and shuffled epoch
 order and will not take additional optimizer steps if stopping was already reached.
