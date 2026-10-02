@@ -12,9 +12,11 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoTokenizer,
+    get_scheduler,
 )
 
 from .data import digest, example_tokens, pack, read_examples, unpack
+from .stopping import EarlyStopping
 
 
 class Trainer:
@@ -145,6 +147,38 @@ class Trainer:
             "seconds": time.monotonic() - started,
         }
 
+    def save_adapter(self, directory):
+        shutil.rmtree(directory, ignore_errors=True)
+        self.model.save_pretrained(
+            directory,
+            safe_serialization=True,
+            selected_adapters=[self.model.active_adapter],
+        )
+        nested = directory / self.model.active_adapter
+        if nested.is_dir():
+            for path in nested.iterdir():
+                shutil.move(str(path), directory / path.name)
+            nested.rmdir()
+
+    def evaluate(self, examples):
+        self.model.eval()
+        loss = 0.0
+        tokens = 0
+        with torch.no_grad():
+            for item in examples:
+                self.check()
+                count = sum(label != -100 for label in item["labels"][1:])
+                batch = {
+                    key: torch.tensor([value], device=self.input_device)
+                    for key, value in item.items()
+                }
+                loss += self.model(**batch).loss.item() * count
+                tokens += count
+        self.model.train()
+        if not tokens or not math.isfinite(loss):
+            raise ValueError("Invalid validation loss")
+        return loss / tokens
+
     def train(
         self,
         dataset,
@@ -169,9 +203,21 @@ class Trainer:
                 )
             )
         ]
+        validation_sha256 = digest(validation)
+        validation_examples = read_examples(validation)
+        limit = self.recipe.get("validation_examples", 64)
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("validation_examples must be a positive integer")
+        validation_examples = (
+            random.Random(self.recipe["seed"]).sample(
+                validation_examples, min(limit, len(validation_examples))
+            )
+            if "validation_examples" in self.recipe
+            else validation_examples[:limit]
+        )
         validation = [
             tokens
-            for item in read_examples(validation)[:64]
+            for item in validation_examples
             if (
                 tokens := example_tokens(
                     self.tokenizer, item, self.recipe["sequence_length"]
@@ -198,6 +244,13 @@ class Trainer:
             [p for p in self.model.parameters() if p.requires_grad],
             lr=self.recipe["learning_rate"],
         )
+        stopping = (
+            EarlyStopping(**self.recipe["early_stopping"])
+            if self.recipe.get("early_stopping") is not None
+            else None
+        )
+        best = self.root / "best-adapter"
+        state = None
         step = 0
         if checkpoint:
             archive = checkpoint
@@ -217,9 +270,18 @@ class Trainer:
             if (
                 state["dataset_sha256"] != dataset_sha256
                 or state["recipe"] != self.recipe
+                or state.get("validation_sha256", validation_sha256)
+                != validation_sha256
             ):
                 raise ValueError("Checkpoint does not match dataset and recipe")
             optimizer.load_state_dict(state["optimizer"])
+            if stopping:
+                stopping.restore(state["early_stopping"])
+                if stopping.step != state["step"]:
+                    raise ValueError(
+                        "Early stopping state does not match checkpoint step"
+                    )
+                shutil.copytree(directory / "best-adapter", best, dirs_exist_ok=True)
             step = state["step"]
             torch.set_rng_state(state["rng"].cpu())
             if self.device == "cuda":
@@ -231,11 +293,25 @@ class Trainer:
                     torch.cuda.set_rng_state(state["cuda_rng"].cpu())
         if not 0 <= step <= self.recipe["max_steps"]:
             raise ValueError("Invalid checkpoint step")
+        scheduler = None
+        if "lr_scheduler_type" in self.recipe:
+            scheduler = get_scheduler(
+                self.recipe["lr_scheduler_type"],
+                optimizer,
+                num_warmup_steps=self.recipe.get("warmup_steps", 0),
+                num_training_steps=self.recipe["max_steps"],
+            )
+            if state:
+                scheduler.load_state_dict(state["scheduler"])
+                for group, rate in zip(optimizer.param_groups, scheduler.get_last_lr()):
+                    group["lr"] = rate
         self.model.train()
         self.model.config.use_cache = False
         accumulation = self.recipe["gradient_accumulation"]
         emit({"type": "trainer_stage", "stage": "training"})
-        while step < self.recipe["max_steps"]:
+        order = []
+        epoch = -1
+        while step < self.recipe["max_steps"] and not (stopping and stopping.stopped):
             self.check()
             started = time.monotonic()
             optimizer.zero_grad(set_to_none=True)
@@ -243,7 +319,16 @@ class Trainer:
             tokens = 0
             for micro in range(accumulation):
                 self.check()
-                example = data[(step * accumulation + micro) % len(data)]
+                position = step * accumulation + micro
+                current_epoch, index = divmod(position, len(data))
+                if current_epoch != epoch:
+                    order = list(range(len(data)))
+                    if self.recipe.get("shuffle", False):
+                        random.Random(self.recipe["seed"] + current_epoch).shuffle(
+                            order
+                        )
+                    epoch = current_epoch
+                example = data[order[index]]
                 batch = {
                     key: torch.tensor([value], device=self.input_device)
                     for key, value in example.items()
@@ -255,7 +340,10 @@ class Trainer:
                 loss += result.item()
                 tokens += len(example["input_ids"])
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            learning_rate = optimizer.param_groups[0]["lr"]
             optimizer.step()
+            if scheduler:
+                scheduler.step()
             step += 1
             seconds = max(time.monotonic() - started, 0.001)
             emit(
@@ -266,24 +354,17 @@ class Trainer:
                     "train_loss": loss,
                     "tokens_per_second": tokens / seconds,
                     "eta_seconds": seconds * (self.recipe["max_steps"] - step),
+                    "metrics": {"learning_rate": learning_rate},
                 }
             )
-            if step % self.recipe["checkpoint_steps"] == 0:
+            if (
+                step % self.recipe["checkpoint_steps"] == 0
+                or step == self.recipe["max_steps"]
+            ):
                 self.check()
-                self.model.eval()
-                with torch.no_grad():
-                    validation_loss = sum(
-                        self.model(
-                            **{
-                                key: torch.tensor([value], device=self.input_device)
-                                for key, value in item.items()
-                            }
-                        ).loss.item()
-                        for item in validation
-                    ) / len(validation)
-                if not math.isfinite(validation_loss):
-                    raise ValueError("Non-finite validation loss")
-                self.model.train()
+                validation_loss = self.evaluate(validation)
+                if stopping and stopping.observe(step, validation_loss):
+                    self.save_adapter(best)
                 emit(
                     {
                         "type": "note",
@@ -291,24 +372,38 @@ class Trainer:
                         "message": f"Validation loss at step {step}: {validation_loss:.6f}",
                     }
                 )
-                directory = self.root / "checkpoint"
-                shutil.rmtree(directory, ignore_errors=True)
-                self.model.save_pretrained(
-                    directory,
-                    safe_serialization=True,
-                    selected_adapters=[self.model.active_adapter],
+                emit(
+                    {
+                        "type": "trainer_observation",
+                        "name": "validation",
+                        "message": f"Validated step {step} on {len(validation)} examples",
+                        "step": step,
+                        "metrics": {
+                            "validation_loss": validation_loss,
+                            **(
+                                {
+                                    "best_step": stopping.best_step,
+                                    "bad_checks": stopping.bad_checks,
+                                }
+                                if stopping
+                                else {}
+                            ),
+                        },
+                    }
                 )
-                nested = directory / self.model.active_adapter
-                if nested.is_dir():
-                    for path in nested.iterdir():
-                        shutil.move(str(path), directory / path.name)
-                    nested.rmdir()
+                directory = self.root / "checkpoint"
+                self.save_adapter(directory)
+                if stopping:
+                    shutil.copytree(best, directory / "best-adapter")
                 torch.save(
                     {
                         "step": step,
                         "recipe": self.recipe,
                         "dataset_sha256": dataset_sha256,
+                        "validation_sha256": validation_sha256,
                         "optimizer": optimizer.state_dict(),
+                        **({"scheduler": scheduler.state_dict()} if scheduler else {}),
+                        **({"early_stopping": stopping.state()} if stopping else {}),
                         "rng": torch.get_rng_state(),
                         "cuda_rng_all": torch.cuda.get_rng_state_all()
                         if self.device == "cuda"
@@ -318,18 +413,25 @@ class Trainer:
                 )
                 archive = self.root / "checkpoint.tar.gz"
                 pack(directory, archive)
-                save_checkpoint(step, archive)
+                if step % self.recipe["checkpoint_steps"] == 0:
+                    save_checkpoint(step, archive)
         directory = self.root / "adapter"
-        self.model.save_pretrained(
-            directory,
-            safe_serialization=True,
-            selected_adapters=[self.model.active_adapter],
-        )
-        nested = directory / self.model.active_adapter
-        if nested.is_dir():
-            for path in nested.iterdir():
-                shutil.move(str(path), directory / path.name)
-            nested.rmdir()
+        if stopping:
+            shutil.rmtree(directory, ignore_errors=True)
+            shutil.copytree(best, directory)
+            emit(
+                {
+                    "type": "note",
+                    "level": "info",
+                    "message": (
+                        f"Training {'stopped early' if stopping.stopped else 'reached the step limit'} "
+                        f"at step {step}; selected step {stopping.best_step} "
+                        f"with validation loss {stopping.best_loss:.6g}"
+                    ),
+                }
+            )
+        else:
+            self.save_adapter(directory)
         archive = self.root / "adapter.tar.gz"
         pack(directory, archive)
         emit({"type": "trainer_finished", "adapter_sha256": digest(archive)})

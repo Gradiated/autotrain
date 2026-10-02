@@ -23,7 +23,12 @@ trainer = Trainer("./run", recipe={
     "max_steps": 50,
     "sequence_length": 2048,
     "gradient_accumulation": 4,
-    "checkpoint_steps": 10,
+    "checkpoint_steps": 5,
+    "early_stopping": {"patience": 3, "threshold": 0.0001, "min_steps": 10},
+    "validation_examples": 256,
+    "shuffle": True,
+    "lr_scheduler_type": "cosine",
+    "warmup_steps": 5,
 })
 adapter = trainer.train(
     "train.jsonl", "validation.jsonl",
@@ -65,3 +70,27 @@ CPU tests cover both the original Qwen dependency versions and the GLM-compatibl
 runtime, including finite-loss LoRA backward through GLM's mixed attention and MoE
 layers. Full model sizing, throughput and multi-GPU recovery require qualification
 on the caller's target hardware.
+
+With `early_stopping`, validation runs at checkpoint intervals and at the final
+step. Training stops after `patience` checks without an absolute loss improvement
+larger than `threshold`, once `min_steps` is reached. The returned adapter always
+comes from the lowest validation-loss checkpoint, including when training reaches
+the hard step limit. Validation measures completion-token-weighted loss on a fixed
+seeded sample of up to `validation_examples` examples; use a representative,
+leakage-free validation set. The test set belongs to final evaluation and must not
+be supplied here. This follows the validation/patience/best-checkpoint pattern in
+[Transformers](https://huggingface.co/docs/transformers/en/main_classes/callback),
+within this library's custom PyTorch loop; it does not instantiate HF `Trainer` or
+TRL `SFTTrainer`.
+
+Checkpoints contain the current optimizer, scheduler, RNG, early stopping counters
+and a copy of the best adapter. Resuming preserves the sample and shuffled epoch
+order and will not take additional optimizer steps if stopping was already reached.
+Both training and validation file hashes are checked on resume. Recipes without
+these optional settings retain fixed-step training and constant learning rate.
+
+These settings are starting points, not tuned hyperparameters. Rank, learning rate,
+effective batch size, evaluation frequency and total training budget need validation
+for each model and dataset. Fifty steps is a small qualification budget, not a
+universal production SFT duration. Low validation loss is a selection signal;
+generated-answer quality and regressions still need a separate held-out evaluation.
