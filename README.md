@@ -47,3 +47,21 @@ workflows, scheduling, GPU provisioning, or container images.
 
 The CPU tests use a tiny synthetic Qwen model and assert exact adapter weights
 across uninterrupted and resumed training. They do not qualify live GPU training.
+
+The caller chooses the model and pins its revision in the recipe. For an image/text
+model used with text-only examples, set `model_task="image_text_to_text"`; the
+default remains `causal_lm`. `target_modules` selects the LoRA projections, and
+`attention` selects the Transformers attention implementation. These are model
+settings, not infrastructure settings.
+
+For models that exceed one GPU, set `gpu_count` to the number already assigned to
+the process. The trainer balances complete decoder layers across those visible
+GPUs, keeps 15% of their memory for activations, and rejects CPU/disk offload.
+`gradient_checkpointing=True` reduces activation memory. Inputs follow the
+embedding device, and checkpoints preserve RNG state for every visible GPU. The
+caller owns GPU assignment, capacity admission and process lifetime.
+
+CPU tests cover both the original Qwen dependency versions and the GLM-compatible
+runtime, including finite-loss LoRA backward through GLM's mixed attention and MoE
+layers. Full model sizing, throughput and multi-GPU recovery require qualification
+on the caller's target hardware.

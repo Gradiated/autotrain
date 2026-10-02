@@ -8,12 +8,21 @@ jobs:
     timeout-minutes: 15
     strategy:
       matrix:
-        torch: ["2.7.1", "2.13.0"]
+        include:
+          - torch: "2.7.1"
+            transformers: "4.53.3"
+            peft: "0.16.0"
+            safetensors: "0.5.3"
+          - torch: "2.13.0"
+            transformers: "5.17.0"
+            peft: "0.21.2"
+            safetensors: "0.8.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: pip install torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install transformers==${{ matrix.transformers }} peft==${{ matrix.peft }} safetensors==${{ matrix.safetensors }}
       - run: pip install .
       - run: python -m unittest discover -s tests
