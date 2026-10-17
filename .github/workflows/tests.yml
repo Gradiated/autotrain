@@ -26,3 +26,13 @@ jobs:
       - run: pip install transformers==${{ matrix.transformers }} peft==${{ matrix.peft }} safetensors==${{ matrix.safetensors }}
       - run: pip install .
       - run: python -m unittest discover -s tests
+  tests-passed:
+    name: Tests passed
+    runs-on: ubuntu-latest
+    needs: cpu
+    if: ${{ always() }}
+    steps:
+      - name: Require every CPU matrix job to succeed
+        env:
+          CPU_RESULT: ${{ needs.cpu.result }}
+        run: test "$CPU_RESULT" = success
