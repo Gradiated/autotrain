@@ -97,3 +97,14 @@ effective batch size, evaluation frequency and total training budget need valida
 for each model and dataset. Fifty steps is a small qualification budget, not a
 universal production SFT duration. Low validation loss is a selection signal;
 generated-answer quality and regressions still need a separate held-out evaluation.
+
+## Review gate
+
+Every pull request to `main` needs the required `AI review passed` status, set by
+`.github/workflows/ai-review-gate.yml`. It passes once both AI reviewers, Codex
+(`chatgpt-codex-connector[bot]`) and Graphite (the `Graphite / AI Reviews` check),
+have reviewed at least one commit of the PR. No human approval is required, but
+every review thread must be resolved and `Tests passed` must be green. If Codex
+did not run or failed, comment `@codex review` on the PR; for Graphite, re-run
+the AI review from the check's Details link. To re-evaluate a PR by hand, run
+`gh workflow run ai-review-gate.yml -f pr=<number>`.
